@@ -1,0 +1,254 @@
+theory line_group_v1_malicious_member_analysis
+begin
+
+// ==========================================================
+// 1. 基本設定・暗号プリミティブ
+// ==========================================================
+builtins: diffie-hellman
+functions: enc/2, dec/2, kdf/2, mac/2, pair/2
+
+// 復号の正当性定義 [cite: 286]
+equations:
+  dec(enc(m, k), k) = m
+
+// MAC検証ロジック
+restriction Equality:
+  "All x y #i. Eq(x,y)@i ==> x=y"
+
+// InitUsersルールが一度しか実行されないように制限
+restriction OnlyOneInit:
+  "All #i #j. OnlyOnce() @ #i & OnlyOnce() @ #j ==> #i = #j"
+// ==========================================================
+// 2. ユーザー初期化・鍵生成・登録
+// ==========================================================
+
+rule Init:
+  [ Fr(~aID), Fr(~skA), Fr(~bID), Fr(~skB), Fr(~cID), Fr(~skC) ]
+  --[ InitUsers(~aID, ~bID, ~cID), OnlyOnce() ]->
+  [ !InitA(~aID, ~skA), !InitB(~bID, ~skB), !InitC(~cID, ~skC) ]
+
+rule KeyGeneration_A:
+  let pkA = 'g' ^ ~skA in
+  [ !InitA(~aID, ~skA), Fr(~GK)]
+  --[ GenKeyA(~aID), GroupSecretEstablished(~aID, ~GK) ]->
+  [ !LongTermKeyA(~aID, ~skA), !PublicKeyA(~aID, pkA), !GroupKey(~aID, ~skA,~GK) ]
+
+rule KeyGeneration_B:
+  let pkB = 'g' ^ ~skB in
+  [ !InitB(~bID, ~skB) ]
+  --[ GenKeyB(~bID) ]->
+  [ !LongTermKeyB(~bID, ~skB), !PublicKeyB(~bID, pkB) ]
+
+rule KeyGeneration_C:
+  let pkC = 'g' ^ ~skC in
+  [ !InitC(~cID, ~skC) ]
+  --[ GenKeyC(~cID) ]->
+  [ !LongTermKeyC(~cID, ~skC), !PublicKeyC(~cID, pkC) ]
+
+// 公開鍵登録時の変数から ~ を削除し、既存の事実を参照するように修正
+rule RegisterPK_A:
+  [ !PublicKeyA(aID, pkA) ] --[ PKRegisteredA(aID, pkA) ]-> [ !KeyServerA(aID, pkA) ]
+
+rule RegisterPK_B:
+  [ !PublicKeyB(bID, pkB) ] --[ PKRegisteredB(bID, pkB) ]-> [ !KeyServerB(bID, pkB) ]
+
+rule RegisterPK_C:
+  [ !PublicKeyC(cID, pkC) ] --[ PKRegisteredC(cID, pkC) ]-> [ !KeyServerC(cID, pkC) ]
+
+rule Publish_PKs:
+  [ !KeyServerA(aID, pkA), !KeyServerB(bID, pkB), !KeyServerC(cID, pkC) ]
+  -->
+  [ Out(pkA), Out(pkB), Out(pkC) ]
+
+// ==========================================================
+// 3. 1対1 共通鍵生成
+// ==========================================================
+
+rule A_GenerateSharedSecret_with_B:
+  let ssAB = pkB_server ^ skA in
+  [ !LongTermKeyA(aID, skA), !KeyServerB(bID, pkB_server) ] 
+  --[ A_GenSS_B(aID, bID) ]->
+  [ !SharedSecret_A_B(ssAB, aID, bID) ]
+
+rule A_GenerateSharedSecret_with_C:
+  let ssAC = pkC_server ^ skA in
+  [ !LongTermKeyA(aID, skA), !KeyServerC(cID, pkC_server) ]
+  --[ A_GenSS_C(aID, cID) ]->
+  [ !SharedSecret_A_C(ssAC, aID, cID) ]
+
+rule B_GenerateSharedSecret_with_A:
+  let ssBA = pkA_server ^ skB in
+  [ !LongTermKeyB(bID, skB), !KeyServerA(aID, pkA_server) ]
+  --[ B_GenSS_A(bID, aID) ]->
+  [ !SharedSecret_B_A(ssBA, bID, aID) ]
+
+rule C_GenerateSharedSecret_with_A:
+  let ssCA = pkA_server ^ skC in
+  [ !LongTermKeyC(cID, skC), !KeyServerA(aID, pkA_server) ]
+  --[ C_GenSS_A(cID, aID) ]->
+  [ !SharedSecret_C_A(ssCA, cID, aID) ]
+
+// ==========================================================
+// 4. グループ鍵(GK)の配布
+// ==========================================================
+
+rule A_Shares_GroupKey_To_B:
+  [ !GroupKey(aID, skA, GK), !SharedSecret_A_B(ssAB, aID, bID) ]
+  --[ AShareGK_B(aID, bID) ]->
+  [ Out(enc(GK, ssAB)) ]
+
+rule A_Shares_GroupKey_To_C:
+  [ !GroupKey(aID, skA, GK), !SharedSecret_A_C(ssAC, aID, cID) ]
+  --[ AShareGK_C(aID, cID) ]->
+  [ Out(enc(GK, ssAC)) ]
+
+rule B_Receives_GroupKey:
+  let gk = dec(encrypted_gk, ssBA) in
+  [ !SharedSecret_B_A(ssBA, bID, aID), In(encrypted_gk) ]
+  --[ B_Got_GK(bID), GroupSecretEstablished(bID, gk) ]->
+  [ !GroupKey_B(bID, gk) ]
+
+rule C_Receives_GroupKey:
+  let gk = dec(encrypted_gk, ssCA) in
+  [ !SharedSecret_C_A(ssCA, cID, aID), In(encrypted_gk) ]
+  --[ C_Got_GK(cID), GroupSecretEstablished(cID, gk) ]->
+  [ !GroupKey_C(cID, gk) ]
+
+// ==========================================================
+// 5. メッセージの送受信
+// ==========================================================
+
+rule B_Sends_Message:
+  let
+    sgk = kdf(gk, ~salt)
+    ct = enc(~m, sgk)
+    mac_val = mac(ct, sgk) // v1: MACは暗号文のみを保護
+    payload = <ct, ~salt, mac_val>
+    metadata = <bID, 'gID'>
+  in
+  [ !GroupKey_B(bID, gk), Fr(~m), Fr(~salt) ]
+  --[ SentB(bID, ~m, ~salt), Honest(bID) ]->
+  [ Out(<metadata, payload>) ]
+
+rule C_Receives_Message:
+  let
+    metadata = <sender, 'gID'>
+    payload = <ct, salt, mac_val>
+    sgk = kdf(gk, salt)
+    expected_mac = mac(ct, sgk)
+    m = dec(ct, sgk)
+  in
+  [ !GroupKey_C(cID, gk), In(<metadata, payload>) ]
+  --[ CReceived(sender, m, salt, ct), Eq(mac_val, expected_mac) ]->
+  [ !CDecryptedMessage(m) ]
+
+rule A_Receives_Message:
+  let
+    metadata = <sender, 'gID'>
+    payload = <ct, salt, mac_val>
+    sgk = kdf(GK, salt)
+    expected_mac = mac(ct, sgk)
+    m = dec(ct, sgk)
+  in
+  [ !GroupKey(aID, skA, GK), In(<metadata, payload>) ]
+  --[ AReceived(sender, m, salt), Eq(mac_val, expected_mac) ]->
+  [ !ADecryptedMessage(m) ]
+
+// ==========================================================
+// 6. 攻撃者の能力
+// ==========================================================
+
+// 長期鍵の漏洩
+rule Reveal_Ltk_A:
+  [ !InitA(id, sk) ] --[ Revealed(id) ]-> [ Out(sk) ]
+rule Reveal_Ltk_B:
+  [ !InitB(id, sk) ] --[ Revealed(id) ]-> [ Out(sk) ]
+rule Reveal_Ltk_C:
+  [ !InitC(id, sk) ] --[ Revealed(id) ]-> [ Out(sk) ]
+
+// グループ共有鍵(GK)の漏洩 (悪意のあるメンバーの再現) 
+rule Malicious_Member_Reveals_GK:
+  [ !GroupKey_C(uID, gk) ] --[ RevealedGK(uID) ]-> [ Out(gk) ]
+
+// ヘッダー改竄 (gIDを定数 'gID' に固定してタイムアウトを回避) [cite: 444, 477, 538]
+rule Attacker_Manipulates_Header:
+  [ In(< <sender, 'gID'>, payload >), Fr(~fakeSender) ]
+  -->
+  [ Out(< <~fakeSender, 'gID'>, payload >) ]
+
+// ===================================================
+// ===== 検証用 Lemma 一式 (変更なし) =====
+// ===================================================
+
+lemma authenticity_vulnerable_C:
+  "All sender m salt ct #i.
+      CReceived(sender, m, salt, ct) @ #i
+    ==>
+      (Ex #j. SentB(sender, m, salt) @ #j & j < i)"
+
+
+lemma integrity_metadata_vulnerable:
+  "All s1 s2 m salt ct #i #j.
+      CReceived(s1, m, salt, ct) @ #i &
+      SentB(s2, m, salt) @ #j &
+      #j < #i
+    ==> s1 = s2"
+
+lemma message_secrecy_vulnerable:
+  "All bID m salt #i.
+      SentB(bID, m, salt) @ #i & Honest(bID) @ #i
+    ==> not (Ex #j. K(m) @ #j)"
+
+lemma replay_protection_A:
+  "All aID m salt #i #j.
+      AReceived(aID, m, salt) @ i
+      & AReceived(aID, m, salt) @ j
+    ==> #i = #j"
+
+lemma replay_protection_C:
+  "All cID m salt ct #i #j.
+      CReceived(cID, m, salt, ct) @ i
+      & CReceived(cID, m, salt, ct) @ j
+    ==> #i = #j"
+
+lemma forward_secrecy_of_group_key:
+  "All userID gk #i.
+      GroupSecretEstablished(userID, gk) @ #i
+    ==>
+      (
+        not(Ex #k. K(gk) @ #k)
+        | (Ex aID #r. Revealed(aID) @ #r & r < i)
+        | (Ex bID #r. Revealed(bID) @ #r & r < i)
+        | (Ex cID #r. Revealed(cID) @ #r & r < i)
+      )
+  "
+
+lemma backward_secrecy_of_future_messages:
+  "All aID bID cID m uID salt #i #j.
+      Revealed(uID) @ #j
+      & j < i
+      & SentB(bID, m, salt) @ #i
+      & Honest(aID) @ #i
+      & Honest(bID) @ #i
+      & Honest(cID) @ #i
+    ==>
+      not(Ex #k. K(m) @ #k)
+  "
+
+lemma authenticity_A_from_sender:
+  "All sender m salt #i.
+      AReceived(sender, m, salt) @ #i
+    ==>
+      ( (Ex #j. SentB( sender, m, salt ) @ #j & j < i) |
+        (Ex #k. Revealed( sender ) @ #k)
+        | (Ex uID #k. RevealedGK( uID ) @ #k)
+      )"
+
+lemma group_model_sanity_check:
+  exists-trace
+  "Ex sender m salt ct #i #j bID.
+      CReceived(sender, m, salt, ct) @ #i
+      & SentB(bID, m, salt) @ #j
+  "
+
+end

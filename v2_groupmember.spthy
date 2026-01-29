@@ -1,0 +1,191 @@
+theory line_group_v2_malicious_member_analysis
+begin
+
+// ==========================================================
+// 1. 基本設定・暗号プリミティブ
+// ==========================================================
+builtins: diffie-hellman
+functions: aenc/4, adec/4, kdf/2, pair/2
+
+// AES-GCM (AEAD) の定義
+equations:
+  adec(aenc(m, aad, k, n), aad, k, n) = m 
+
+restriction OnlyOneInit:
+  "All #i #j. OnlyOnce() @ #i & OnlyOnce() @ #j ==> #i = #j"
+
+restriction Equality:
+  "All x y #i. Eq(x,y)@i ==> x=y"
+
+// ==========================================================
+// 2. ユーザー初期化と公開鍵登録
+// ==========================================================
+
+rule Init:
+  [ Fr(~aID), Fr(~skA), Fr(~bID), Fr(~skB), Fr(~cID), Fr(~skC) ]
+  --[ InitUsers(~aID, ~bID, ~cID), OnlyOnce() ]->
+  [ !InitA(~aID, ~skA), !InitB(~bID, ~skB), !InitC(~cID, ~skC) ]
+
+rule RegisterPKs:
+  [ !InitA(~aID, ~skA), !InitB(~bID, ~skB), !InitC(~cID, ~skC) ]
+  --[ PKRegisteredA(~aID, 'g'^~skA), PKRegisteredB(~bID, 'g'^~skB), PKRegisteredC(~cID, 'g'^~skC) ]-> 
+  [ !KeyServerA(~aID, 'g'^~skA), !KeyServerB(~bID, 'g'^~skB), !KeyServerC(~cID, 'g'^~skC) ] 
+
+// ==========================================================
+// 3. 鍵配布 (Aが共有鍵~GKを生成し配布)
+// ==========================================================
+
+rule A_Distribute_GK:
+  let pkB = pkB_server
+      pkC = pkC_server
+      ssAB = pkB ^ ~skA
+      ssAC = pkC ^ ~skA in
+  [ !InitA(~aID, ~skA), !KeyServerB(~bID, pkB_server), !KeyServerC(~cID, pkC_server), Fr(~GK) ]
+  --[ GroupSecretEstablished(~aID, ~GK) ]->
+  [ !GroupKeyA(~aID, ~GK), 
+    Out(aenc(~GK, 'aad', ssAB, 'n1')), 
+    Out(aenc(~GK, 'aad', ssAC, 'n2'))
+  ]
+
+rule B_Receives_GK:
+  let ssBA = pkA ^ ~skB
+      gk = adec(encGK, 'aad', ssBA, 'n1') in
+  [ !InitB(~bID, ~skB), !KeyServerA(~aID, pkA), In(encGK) ]
+  --[ GroupSecretEstablished(~bID, gk) ]->
+  [ !B_Has_GK(~bID, gk) ]
+
+rule C_Receives_GK:
+  let ssCA = pkA ^ ~skC
+      gk = adec(encGK, ssCA, 'aad', 'n2') in // adec引数順序合わせ
+  [ !InitC(~cID, ~skC), !KeyServerA(~aID, pkA), In(encGK) ]
+  --[ GroupSecretEstablished(~cID, gk) ]->
+  [ !C_Has_GK(~cID, gk) ]
+
+// ==========================================================
+// 4. メッセージ送信 (Bが送信者)
+// ==========================================================
+
+rule B_Sends_Message:
+  let sgk = kdf(gk, ~salt)
+      metadata = <~bID, 'gID'> // AAD
+      nonce = <~counter, ~rand>
+      ct = aenc(~m, metadata, sgk, nonce) in
+  [ !B_Has_GK(~bID, gk), Fr(~m), Fr(~salt), Fr(~counter), Fr(~rand) ]
+  --[ SentB(~bID, ~m, ~salt), Honest(~bID) ]->
+  [ Out(<metadata, <ct, ~salt, nonce>>) ]
+
+// ==========================================================
+// 5. メッセージ受信 (AとCが受取人)
+// ==========================================================
+
+rule A_Receives_Message:
+  let metadata = <senderInMetadata, 'gID'>
+      sgk = kdf(~GK, salt)
+      m = adec(ct, metadata, sgk, nonce) in
+  [ !GroupKeyA(~aID, ~GK), In(<metadata, <ct, salt, nonce>>) ]
+  --[ AReceived(senderInMetadata, m, salt, ct), Eq(m, m) ]-> []
+
+rule C_Receives_Message:
+  let metadata = <senderInMetadata, 'gID'>
+      sgk = kdf(gk, salt)
+      m = adec(ct, metadata, sgk, nonce) in
+  [ !C_Has_GK(~cID, gk), In(<metadata, <ct, salt, nonce>>) ]
+  --[ CReceived(senderInMetadata, m, salt, ct), Eq(m, m) ]-> []
+
+// ==========================================================
+// 6. 攻撃者モデル (悪意のあるメンバーとLTK漏洩)
+// ==========================================================
+
+// 悪意のあるメンバーCがグループ鍵を外部へ流出させる
+rule Malicious_Member_Reveals_GK:
+  [ !C_Has_GK(uID, gk) ] --[ RevealedGK(uID) ]-> [ Out(gk) ]
+
+rule Attacker_Manipulates_Header:
+  [ In(< <sender, gID>, payload >), Fr(~fakeSender) ]
+  --[ ManipulatedHeader(sender, ~fakeSender) ]->
+  [ Out(< <~fakeSender, gID>, payload >) ]
+
+// 長期鍵の漏洩
+rule Reveal_Ltk_A:
+  [ !InitA(id, sk) ] --[ Revealed(id) ]-> [ Out(sk) ]
+rule Reveal_Ltk_B:
+  [ !InitB(id, sk) ] --[ Revealed(id) ]-> [ Out(sk) ]
+rule Reveal_Ltk_C:
+  [ !InitC(id, sk) ] --[ Revealed(id) ]-> [ Out(sk) ]
+// ==========================================================
+// 6. 検証用 Lemma
+// ==========================================================
+
+// ==========================================================
+// 7. Lemma 一式 (指定された順番)
+// ==========================================================
+
+// 1. 実行可能性
+lemma protocol_is_executable_full_run:
+  exists-trace
+  "Ex sender m salt ct #i. CReceived(sender, m, salt, ct) @ i"
+
+// 2. PKI健全性
+lemma pki_soundness:
+  "All aID pkA #i #j.
+      PKRegisteredA(aID, pkA) @ i & PKRegisteredA(aID, pkA) @ j
+    ==> #i = #j"
+
+// 3. 内容の完全性 (Verified期待)
+lemma authenticity_message_only_C:
+  "All sInMeta m salt ct #i.
+      CReceived(sInMeta, m, salt, ct) @ #i
+    ==>
+      ( (Ex anySender #j. SentB(anySender, m, salt) @ #j & j < i) 
+        | (Ex uID #k. Revealed(uID) @ #k)
+        | (Ex uID2 #k2. RevealedGK(uID2) @ #k2) )"
+
+// 4. メッセージの秘匿性 (Falsified期待: 悪意のあるメンバーがいるため)
+lemma message_secrecy:
+  "All bID m salt #i.
+      SentB(bID, m, salt) @ #i & Honest(bID) @ #i
+    ==> not (Ex #j. K(m) @ #j)"
+
+// 5. リプレイ耐性 (A)
+lemma replay_protection_A:
+  "All aID m salt ct #i #j.
+      AReceived(aID, m, salt, ct) @ i
+      & AReceived(aID, m, salt, ct) @ j
+    ==> #i = #j"
+
+// 6. リプレイ耐性 (C)
+lemma replay_protection_C:
+  "All cID m salt ct #i #j.
+      CReceived(cID, m, salt, ct) @ i
+      & CReceived(cID, m, salt, ct) @ j
+    ==> #i = #j"
+
+// 7. 前方秘匿性 (Falsified期待: Static DHのため)
+lemma forward_secrecy_of_group_key:
+  "All userID gk #i.
+      GroupSecretEstablished(userID, gk) @ #i
+    ==> not(Ex #k. K(gk) @ #k)"
+
+// 8. 後方秘匿性 (Falsified期待: GKが更新されないため)
+lemma backward_secrecy_of_future_messages:
+  "All bID m salt #i #j uID. 
+      Revealed(uID) @ #j & #j < #i & SentB(bID, m, salt) @ #i
+    ==> not(Ex #k. K(m) @ #k)"
+
+// 9. メタデータの整合性 (Verified期待: AAD保護)
+lemma authenticity_A_from_sender:
+  "All sender m salt ct #i.
+      AReceived(sender, m, salt, ct) @ #i
+    ==>
+      ( (Ex #j. SentB( sender, m, salt ) @ #j & j < i) 
+        | (Ex uID #k. Revealed(uID) @ #k)
+        | (Ex uID2 #k2. RevealedGK(uID2) @ #k2) )"
+
+// 10. 匿名性/サニティチェック
+lemma group_model_sanity_check:
+  exists-trace
+  "Ex sender m salt ct #i #j bID.
+      CReceived(sender, m, salt, ct) @ #i
+      & SentB(bID, m, salt) @ #j"
+
+end

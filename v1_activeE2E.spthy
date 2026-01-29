@@ -1,0 +1,190 @@
+theory line_group_v1_vulnerable_analysis
+begin
+
+// ==========================================================
+// 1. 基本設定・暗号プリミティブ
+// ==========================================================
+builtins: diffie-hellman
+functions: enc/2, dec/2, kdf/2, mac/2, pair/2
+
+// 復号の定義
+equations:
+  dec(enc(m, k), k) = m
+
+// セッション初期化を一度に制限
+restriction OnlyOneInit:
+  "All #i #j. OnlyOnce() @ #i & OnlyOnce() @ #j ==> #i = #j"
+
+// MAC検証用
+restriction Equality:
+  "All x y #i. Eq(x,y)@i ==> x=y"
+
+// ==========================================================
+// 2. ユーザー初期化と長期鍵登録 [cite: 28, 70]
+// ==========================================================
+
+rule Init:
+  [ Fr(~aID), Fr(~skA), Fr(~bID), Fr(~skB), Fr(~cID), Fr(~skC) ]
+  --[ InitUsers(~aID, ~bID, ~cID), OnlyOnce() ]->
+  [ !InitA(~aID, ~skA), !InitB(~bID, ~skB), !InitC(~cID, ~skC) ]
+
+rule RegisterPKs:
+  let pkA = 'g'^~skA
+      pkB = 'g'^~skB
+      pkC = 'g'^~skC
+  in
+  [ !InitA(~aID, ~skA), !InitB(~bID, ~skB), !InitC(~cID, ~skC) ]
+  --[ PKRegisteredA(~aID, pkA) ]-> 
+  [ !KeyServerA(~aID, pkA), !KeyServerB(~bID, pkB), !KeyServerC(~cID, pkC) ] 
+
+// ==========================================================
+// 3. 鍵配布 (Static DHによるグループ鍵配布) [cite: 157, 162, 165]
+// ==========================================================
+
+rule A_Distribute_GK:
+  let 
+      // 脆弱性の核心: エフェメラルキーを使わず、登録済みの長期鍵(Static DH)でGKを暗号化
+      ssAB = pkB ^ ~skA
+      ssAC = pkC ^ ~skA 
+  in
+  [ !InitA(~aID, ~skA), !KeyServerB(~bID, pkB), !KeyServerC(~cID, pkC), Fr(~GK) ]
+  --[ GroupSecretEstablished(~GK), Honest(~aID), Honest(~bID), Honest(~cID) ]->
+  [ !GroupKeyA(~aID, ~GK), 
+    Out(enc(~GK, ssAB)), 
+    Out(enc(~GK, ssAC)) 
+  ]
+
+rule B_Receives_GK:
+  let ssBA = pkA ^ ~skB
+      gk = dec(encGK, ssBA) in
+  [ !InitB(~bID, ~skB), !KeyServerA(~aID, pkA), In(encGK) ]
+  --[ GroupSecretEstablished(gk) ]->
+  [ !B_Has_GK(~bID, gk) ]
+
+rule C_Receives_GK:
+  let ssCA = pkA ^ ~skC
+      gk = dec(encGK, ssCA) in
+  [ !InitC(~cID, ~skC), !KeyServerA(~aID, pkA), In(encGK) ]
+  --[ GroupSecretEstablished(gk) ]->
+  [ !C_Has_GK(~cID, gk) ]
+
+// ==========================================================
+// 4. メッセージ送受信 (v1: CBC + MAC) [cite: 56, 176, 180]
+// ==========================================================
+
+rule B_Sends_Message:
+  let sgk = kdf(gk, ~salt)
+      ct = enc(~m, sgk)
+      mac_val = mac(ct, sgk) // v1: メタデータを含まないMAC 
+      metadata = <~bID, 'gID'>
+      payload = <ct, ~salt, mac_val>
+  in
+  [ !B_Has_GK(~bID, gk), Fr(~m), Fr(~salt) ]
+  --[ SentB(~bID, ~m, ~salt), Honest(~bID) ]->
+  [ Out(<metadata, payload>) ]
+
+rule C_Receives_Message:
+  let metadata = <senderInMetadata, 'gID'>
+      payload = <ct, salt, mac_val>
+      sgk = kdf(gk, salt)
+      expected_mac = mac(ct, sgk)
+      m = dec(ct, sgk)
+  in
+  [ !C_Has_GK(~cID, gk), In(<metadata, payload>) ]
+  --[ CReceived(senderInMetadata, m, salt, ct), Eq(mac_val, expected_mac) ]->
+  []
+
+rule A_Receives_Message:
+  let metadata = <senderInMetadata, 'gID'>
+      payload = <ct, salt, mac_val>
+      sgk = kdf(~GK, salt)
+      expected_mac = mac(ct, sgk)
+      m = dec(ct, sgk)
+  in
+  [ !GroupKeyA(~aID, ~GK), In(<metadata, payload>) ]
+  --[ AReceived(~aID, m, salt), Eq(mac_val, expected_mac) ]->
+  []
+
+// ==========================================================
+// 5. 攻撃者モデル (長期鍵の漏洩)
+// ==========================================================
+
+rule Reveal_LTK:
+  [ !InitA(id, sk) ] --[ Revealed(id) ]-> [ Out(sk) ]
+
+// 長期鍵の漏洩
+rule Reveal_Ltk_A:
+  [ !InitA(id, sk) ] --[ Revealed(id) ]-> [ Out(sk) ]
+rule Reveal_Ltk_B:
+  [ !InitB(id, sk) ] --[ Revealed(id) ]-> [ Out(sk) ]
+rule Reveal_Ltk_C:
+  [ !InitC(id, sk) ] --[ Revealed(id) ]-> [ Out(sk) ]
+// ==========================================================
+// 7. 検証用 Lemma
+// ==========================================================
+
+// 1. 実行可能性
+lemma protocol_is_executable_full_run:
+  exists-trace
+  "Ex sender m salt ct #i. CReceived(sender, m, salt, ct) @ i"
+
+// 2. 認証性 (PKI)
+lemma pki_soundness:
+  "All aID pkA #i #j.
+      PKRegisteredA(aID, pkA) @ i & PKRegisteredA(aID, pkA) @ j
+    ==> #i = #j"
+
+// 3. 内容の完全性 (Payload Integrity)
+// メッセージ内容mが改竄されていなければVerifiedになる
+lemma authenticity_payload_only_C:
+  "All sInMeta m salt ct #i.
+      CReceived(sInMeta, m, salt, ct) @ #i
+    ==>
+      ( (Ex anySender #j. SentB(anySender, m, salt) @ #j & j < i) 
+        | (Ex uID #k. Revealed(uID) @ #k) )"
+
+// 4. メッセージの秘匿性
+lemma message_secrecy:
+  "All bID m salt #i.
+      SentB(bID, m, salt) @ #i & Honest(bID) @ #i
+    ==> not (Ex #j. K(m) @ #j) | (Ex uID #k. Revealed(uID) @ #k)"
+
+// 5. リプレイ耐性 (A)
+lemma replay_protection_A:
+  "All aID m salt #i #j.
+      AReceived(aID, m, salt) @ i & AReceived(aID, m, salt) @ j
+    ==> #i = #j"
+
+// 6. リプレイ耐性 (C)
+lemma replay_protection_C:
+  "All cID m salt ct #i #j.
+      CReceived(cID, m, salt, ct) @ i & CReceived(cID, m, salt, ct) @ j
+    ==> #i = #j"
+
+// --- 前方秘匿性 (Forward Secrecy) ---
+// セッション終了後に長期鍵が漏洩しても、過去のGKが漏洩するため Falsified (脆弱)
+lemma forward_secrecy_vulnerable:
+  "All gk #i. GroupSecretEstablished(gk) @ #i
+    ==> ( not(Ex #k. K(gk) @ #k) | (Ex id #r. Revealed(id) @ #r & r < i) )"
+
+// --- 後方秘匿性 (Backward Secrecy) ---
+// 過去に長期鍵が漏洩していると、未来のGKが計算可能になるため Falsified (脆弱)
+lemma backward_secrecy_vulnerable:
+  "All bID m salt #i #j uID. 
+      Revealed(uID) @ #j & #j < #i & SentB(bID, m, salt) @ #i & Honest(bID) @ #i
+    ==> not(Ex #k. K(m) @ #k)"
+
+// 10. メタデータの整合性 (Falsifiedを想定: v1の脆弱性)
+lemma authenticity_metadata_C:
+  "All sInMeta m salt ct #i.
+      CReceived(sInMeta, m, salt, ct) @ #i
+    ==> ( (Ex #j. SentB(sInMeta, m, salt) @ #j & j < i) 
+        | (Ex uID #k. Revealed(uID) @ #k) )"
+
+// 11. サニティチェック
+lemma group_model_sanity_check:
+  exists-trace
+  "Ex sender m salt ct #i #j bID.
+      CReceived(sender, m, salt, ct) @ #i & SentB(bID, m, salt) @ #j"
+
+end
